@@ -805,23 +805,8 @@ def get_video_path(job_id):
     return os.path.join(video_dir, 'final_video.mp4')
 
 async def generate_images_from_storyboards_async(storyboards: list, job_id: str, style: str = "realistic", size: str = "1024x1024", progress_callback=None):
-    """
-    根据分镜异步生成图片(使用通义万相API)
-    Args:
-        storyboards: 分镜列表，包含description、mood、keywords等字段
-        job_id: 任务ID
-        style: 图片风格
-        size: 图片尺寸
-        progress_callback: 进度回调函数
-    Returns:
-        (image_paths, errors): 图片路径列表和错误列表
-    """
     output_dir = get_image_dir(job_id)
-    
-    # 初始化通义万相图片生成器
     image_generator = ImageGenerator(WANXIANG_API_KEY)
-    
-    # 构建分镜数据
     segments = []
     for scene in storyboards:
         segments.append({
@@ -830,35 +815,23 @@ async def generate_images_from_storyboards_async(storyboards: list, job_id: str,
             "keywords": scene.get("keywords", []),
             "duration": scene.get("duration", 5)
         })
-    
-    # 生成图片
     image_paths = []
     errors = []
     try:
-        results = await image_generator.generate_images(segments)
-        
-        # 下载并保存图片
+        results = await image_generator.generate_images(segments, output_dir=output_dir)
         for idx, result in enumerate(results):
-            if "image_url" in result:
-                image_url = result["image_url"]
-                image_path = os.path.join(output_dir, f"scene_{idx+1}.png")
-                
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(image_url) as resp:
-                        if resp.status == 200:
-                            with open(image_path, 'wb') as f:
-                                f.write(await resp.read())
-                            image_paths.append(image_path)
-                        else:
-                            errors.append(f"scene_{idx+1}: 图片下载失败 HTTP {resp.status}")
+            if "image_path" in result and result["image_path"]:
+                image_paths.append(result["image_path"])
             elif "image_error" in result:
                 errors.append(f"scene_{idx+1}: {result['image_error']}")
-            
             if progress_callback:
                 progress_callback(idx+1, len(segments))
+            # 取消检查
+            with TASKS_LOCK:
+                if job_id in TASKS and TASKS[job_id]["status"] == "cancelled":
+                    return image_paths, errors
     except Exception as e:
         errors.append(f"图片生成失败: {str(e)}")
-    
     return image_paths, errors
 
 def ensure_dir(path):
@@ -869,17 +842,26 @@ async def generate_audio_async(text, output_path, voice="zh-CN-XiaoxiaoNeural"):
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(output_path)
 
-async def generate_audios_from_storyboards_async(storyboards: List[dict], job_id: str, voice="zh-CN-XiaoxiaoNeural", use_aliyun: bool = False, progress_callback=None, image_count=None):
+async def generate_audios_from_storyboards_async(storyboards: list, job_id: str, voice="zh-CN-XiaoxiaoNeural", use_aliyun: bool = False, progress_callback=None, image_count=None):
     output_dir = get_audio_dir(job_id)
     ensure_dir(output_dir)
-    # 只取前 image_count 个分镜生成音频
     if image_count is not None:
         storyboards = storyboards[:image_count]
     texts = [scene.get("dialogue", "") for scene in storyboards]
-    audio_paths, errors = await generate_audio_batch_async(texts, output_dir, voice, use_aliyun)
-    if progress_callback:
-        for idx in range(len(texts)):
+    audio_paths = []
+    errors = []
+    for idx, text in enumerate(texts):
+        try:
+            path = await generate_audio(text, idx+1, output_dir, use_aliyun)
+            audio_paths.append(path)
+        except Exception as e:
+            errors.append(f"audio_{idx+1}: {str(e)}")
+        if progress_callback:
             progress_callback(idx+1, len(texts))
+        # 取消检查
+        with TASKS_LOCK:
+            if job_id in TASKS and TASKS[job_id]["status"] == "cancelled":
+                return audio_paths, errors
     return audio_paths, errors
 
 def natural_key(s):
@@ -1105,12 +1087,23 @@ async def generate_video_from_script(
     storyboards = loop.run_until_complete(generate_storyboards_mixed(script_str))
     storyboards = validate_storyboards(storyboards)
     # 图片生成
+    def image_progress_callback(done, total):
+        with TASKS_LOCK:
+            TASKS[job_id]["progress"] = 15 + int(25 * done / total)
+            TASKS[job_id]["stage"] = f"图片生成 {done}/{total}"
+    def audio_progress_callback(done, total):
+        with TASKS_LOCK:
+            TASKS[job_id]["progress"] = 40 + int(30 * done / total)
+            TASKS[job_id]["stage"] = f"音频生成 {done}/{total}"
     image_paths, image_errors = loop.run_until_complete(
-        generate_images_from_storyboards_async(storyboards, job_id, style)
+        generate_images_from_storyboards_async(storyboards, job_id, style, progress_callback=image_progress_callback)
     )
     image_count = len(image_paths)
-    # 音频生成，严格按图片数量生成
-    audio_paths, audio_errors = loop.run_until_complete(generate_audios_from_storyboards_async(storyboards, job_id, voice, use_aliyun=False, image_count=image_count))
+    # 音频生成
+    audio_paths, audio_errors = loop.run_until_complete(
+        generate_audios_from_storyboards_async(storyboards, job_id, voice, use_aliyun=False, image_count=image_count, progress_callback=audio_progress_callback)
+    )
+    audio_count = len(audio_paths)
     # 视频合成及后处理
     try:
         logging.info(f"[TRACE] 开始视频合成 job_id={job_id}")
@@ -1181,6 +1174,13 @@ async def generate_video_from_script_async(
         # 可扩展字段，如mood/keywords等
         return [{"description": seg, "dialogue": seg} for seg in segments]
 
+    def check_cancel():
+        with TASKS_LOCK:
+            if TASKS[job_id]["status"] == "cancelled":
+                logging.info(f"[CANCEL] 任务被用户取消 job_id={job_id}")
+                return True
+        return False
+
     def task():
         try:
             with TASKS_LOCK:
@@ -1189,11 +1189,11 @@ async def generate_video_from_script_async(
                 TASKS[job_id]["stage"] = "分镜生成"
             # 分镜生成
             try:
+                if check_cancel(): return
                 logging.info(f"[TRACE] 开始分镜生成 job_id={job_id}")
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 script_str = script.decode("utf-8") if isinstance(script, bytes) else script
-                # 集成parse_script，分段并打印日志
                 segments = parse_script(script_str)
                 logging.info(f"[DEBUG] 脚本分段结果: {segments}")
                 if use_ai_storyboard:
@@ -1204,6 +1204,9 @@ async def generate_video_from_script_async(
                     logging.info(f"[TRACE] 分镜生成完成 job_id={job_id} (直接分段模式)")
                 storyboards = validate_storyboards(storyboards)
                 logging.info(f"[TRACE] 分镜校验通过 job_id={job_id}")
+                with TASKS_LOCK:
+                    TASKS[job_id]["progress"] = 15
+                    TASKS[job_id]["stage"] = "图片生成"
             except Exception as e:
                 logging.error(f"[ERROR] 分镜生成失败: {e}\n{traceback.format_exc()}")
                 with TASKS_LOCK:
@@ -1215,9 +1218,10 @@ async def generate_video_from_script_async(
 
             # 图片生成
             try:
+                if check_cancel(): return
                 logging.info(f"[TRACE] 开始图片生成 job_id={job_id}")
                 image_paths, image_errors = loop.run_until_complete(
-                    generate_images_from_storyboards_async(storyboards, job_id, style)
+                    generate_images_from_storyboards_async(storyboards, job_id, style, progress_callback=image_progress_callback)
                 )
                 image_count = len(image_paths)
                 if image_count == 0:
@@ -1229,6 +1233,9 @@ async def generate_video_from_script_async(
                         TASKS[job_id]["stage"] = "图片生成"
                     return
                 logging.info(f"[TRACE] 图片生成完成 job_id={job_id}，图片数: {image_count}")
+                with TASKS_LOCK:
+                    TASKS[job_id]["progress"] = 40
+                    TASKS[job_id]["stage"] = "音频生成"
             except Exception as e:
                 logging.error(f"[ERROR] 图片生成失败: {e}\n{traceback.format_exc()}")
                 with TASKS_LOCK:
@@ -1238,33 +1245,26 @@ async def generate_video_from_script_async(
                     TASKS[job_id]["stage"] = "图片生成"
                 return
 
-            with TASKS_LOCK:
-                TASKS[job_id]["progress"] = 20
-                TASKS[job_id]["stage"] = "音频生成"
             # 音频生成
             try:
+                if check_cancel(): return
                 logging.info(f"[TRACE] 开始音频生成 job_id={job_id}")
-                def progress_callback_audio(done, total):
+                audio_paths, audio_errors = loop.run_until_complete(
+                    generate_audios_from_storyboards_async(storyboards, job_id, voice, use_aliyun=False, image_count=image_count, progress_callback=audio_progress_callback)
+                )
+                audio_count = len(audio_paths)
+                if audio_count == 0:
+                    logging.error(f"[ERROR] 无可用音频，无法继续 job_id={job_id}")
                     with TASKS_LOCK:
-                        TASKS[job_id]["progress"] = 40 + int(30 * done / total)
+                        TASKS[job_id]["status"] = "failed"
+                        TASKS[job_id]["error"] = "音频生成失败"
+                        TASKS[job_id]["progress"] = 0
                         TASKS[job_id]["stage"] = "音频生成"
-                texts = [scene.get("dialogue", "") for scene in storyboards]
-                for idx, text in enumerate(texts):
-                    logging.info(f"[AUDIO] 生成第{idx+1}段音频，文本: {text}")
-                audio_paths, audio_errors = loop.run_until_complete(generate_audios_from_storyboards_async(storyboards, job_id, voice, use_aliyun=False, progress_callback=progress_callback_audio))
-                for idx, path in enumerate(audio_paths):
-                    logging.info(f"[AUDIO] 第{idx+1}段音频已保存: {path}")
-                if audio_errors:
-                    for err in audio_errors:
-                        logging.error(f"[AUDIO] 音频生成错误: {err}")
-                logging.info(f"[TRACE] 音频生成完成 job_id={job_id}，音频数: {len(audio_paths)}，错误: {audio_errors}")
+                    return
+                logging.info(f"[TRACE] 音频生成完成 job_id={job_id}，音频数: {audio_count}，错误: {audio_errors}")
                 with TASKS_LOCK:
-                    TASKS[job_id]["status"] = "finished"
-                    TASKS[job_id]["progress"] = 100
-                    TASKS[job_id]["stage"] = "音频生成完成"
-                    if audio_errors:
-                        TASKS[job_id]["error"] = f"音频生成失败: {audio_errors}"
-                logging.info(f"[TRACE] 任务完成（仅音频验证） job_id={job_id}")
+                    TASKS[job_id]["progress"] = 70
+                    TASKS[job_id]["stage"] = "视频合成"
             except Exception as e:
                 logging.error(f"[ERROR] 音频生成失败: {e}\n{traceback.format_exc()}")
                 with TASKS_LOCK:
@@ -1274,32 +1274,9 @@ async def generate_video_from_script_async(
                     TASKS[job_id]["stage"] = "音频生成"
                 return
 
-            # === BGM 匹配逻辑集成开始 ===
-            music_matcher = MusicMatcher()
-            # 统计所有音频总时长
-            total_duration = 0.0
-            for audio_path in audio_paths:
-                try:
-                    audio_clip = AudioFileClip(audio_path)
-                    total_duration += audio_clip.duration
-                    audio_clip.close()
-                except Exception as e:
-                    logging.warning(f"[BGM] 统计音频时长失败: {audio_path}, {e}")
-            # 分析脚本情绪
-            mood = music_matcher.analyze_script_mood(script_str)
-            # 匹配 BGM
-            bgm_path = music_matcher.match_music(mood, total_duration)
-            if bgm_path:
-                logging.info(f"[BGM] 匹配到背景乐: {bgm_path} (mood={mood}, duration={total_duration:.2f}s)")
-            else:
-                logging.warning(f"[BGM] 未匹配到合适的背景乐 (mood={mood}, duration={total_duration:.2f}s)")
-            # === BGM 匹配逻辑集成结束 ===
-
-            with TASKS_LOCK:
-                TASKS[job_id]["progress"] = 80
-                TASKS[job_id]["stage"] = "视频合成"
             # 视频合成及后处理
             try:
+                if check_cancel(): return
                 logging.info(f"[TRACE] 开始视频合成 job_id={job_id}")
                 from modules.video_merge import merge_video_with_ffmpeg
                 video_path = merge_video_with_ffmpeg(
@@ -1307,7 +1284,7 @@ async def generate_video_from_script_async(
                     audio_paths=audio_paths,
                     output_path=get_video_path(job_id),
                     subtitles=None,
-                    bg_music_path=bgm_path,
+                    bg_music_path=None,
                     resolution="720x1280",
                     fps=30
                 )
@@ -1417,3 +1394,18 @@ def print_audio_image_durations(image_paths, audio_paths):
         print(f'{i+1:>3} | {ad:>13.2f} | {idur:>11.2f} | {abs(ad-idur):>6.2f}')
     print('音频总时长:', sum(audio_durations))
     print('图片片段总时长:', sum(img_durations))
+
+@app.post("/cancel/{job_id}")
+@api_response
+def cancel_job(job_id: str, dependencies=[Depends(verify_token)]):
+    with TASKS_LOCK:
+        task = TASKS.get(job_id)
+        if not task:
+            return {"error": "Invalid job_id"}
+        if task["status"] in ["finished", "failed", "cancelled"]:
+            return {"error": "Task already ended"}
+        task["status"] = "cancelled"
+        task["stage"] = "已取消"
+        task["progress"] = 0
+        task["error"] = "任务被用户取消"
+    return {"job_id": job_id, "status": "cancelled"}

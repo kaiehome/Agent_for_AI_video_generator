@@ -50,8 +50,9 @@ def merge_video_with_ffmpeg(
                     duration = audio_clip.duration
                     audio_clip.close()
                     
-                    # 写入concat文件
-                    f.write(f"file '{img_path}'\n")
+                    # 写入concat文件，图片路径用绝对路径
+                    abs_img_path = os.path.abspath(img_path)
+                    f.write(f"file '{abs_img_path}'\n")
                     f.write(f"duration {duration}\n")
             
             # 2. 合成视频(图像+音频)

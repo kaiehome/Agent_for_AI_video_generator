@@ -114,6 +114,7 @@ function App() {
   const [size, setSize] = useState("1024x1024");
   const [customSize, setCustomSize] = useState("");
   const [useAiStoryboard, setUseAiStoryboard] = useState(true);
+  const videoRef = useRef(null);
 
   useEffect(() => {
     getImageStyles().then(res => {
@@ -132,6 +133,15 @@ function App() {
     });
   }, []);
 
+  // 自动滚动到视频区
+  useEffect(() => {
+    if (videoUrl) {
+      setTimeout(() => {
+        document.getElementById("video-preview")?.scrollIntoView({ behavior: "smooth" });
+      }, 300);
+    }
+  }, [videoUrl]);
+
   // 校验逻辑
   const validate = () => {
     if (!script.trim()) return "脚本不能为空";
@@ -148,22 +158,41 @@ function App() {
     return "";
   };
 
+  const handleCancel = async () => {
+    if (!jobId) return;
+    try {
+      await fetch(`/cancel/${jobId}`, { method: "POST" });
+      setStatus("cancelled");
+      setIsGenerating(false);
+      setProgress(0);
+      setStage("已取消");
+      setError("");
+      clearInterval(intervalRef.current);
+    } catch (e) {
+      setError("取消失败：" + (e.message || e));
+    }
+  };
+
   const handleSubmit = async () => {
+    setIsGenerating(true);
+    setProgress(5);
+    setStage('分镜生成中...');
     setError("");
     setFormError("");
     setVideoUrl("");
     setStatus("提交中...");
-    setProgress(0);
     const err = validate();
     if (err) {
       setFormError(err);
       setStatus("");
+      setIsGenerating(false);
       return;
     }
     let finalSize = size === "自定义" ? customSize : size;
     if (!/^\d+x\d+$/.test(finalSize)) {
       setFormError("图片尺寸格式应为 1024x1024 或 768x768 等");
       setStatus("");
+      setIsGenerating(false);
       return;
     }
     try {
@@ -181,14 +210,15 @@ function App() {
       setStatus("处理中...");
       setProgress(5);
       setStage('分镜生成中...');
-      await pollStatus(id);
+      pollStatus(id);
     } catch (e) {
       setError("提交失败：" + e.message);
       setStatus("");
+      setIsGenerating(false);
     }
   };
 
-  const pollStatus = async (id) => {
+  const pollStatus = (id) => {
     intervalRef.current = setInterval(async () => {
       try {
         const res = await getJobStatus(id);
@@ -210,6 +240,13 @@ function App() {
           setError("生成失败：" + (res.error || "未知错误"));
           setProgress(0);
           setIsGenerating(false);
+          clearInterval(intervalRef.current);
+        }
+        if (res.status === "cancelled") {
+          setStatus("已取消");
+          setIsGenerating(false);
+          setProgress(0);
+          setStage("已取消");
           clearInterval(intervalRef.current);
         }
       } catch (e) {
@@ -256,6 +293,9 @@ function App() {
       padding: 0,
       flexDirection: "column"
     }}>
+      <style>{`
+        @keyframes spin { 0% { transform: rotate(0deg);} 100% { transform: rotate(360deg);} }
+      `}</style>
       <div style={{
         maxWidth: 810,
         width: "98vw",
@@ -277,12 +317,46 @@ function App() {
           fontSize: 28,
           marginBottom: 22
         }}>AI 智能体短视频生成</h2>
+        {/* 错误与状态提示卡片 */}
+        {error && (
+          <div style={{
+            background: "#fff0f0",
+            color: "#e53e3e",
+            border: "1.5px solid #e53e3e55",
+            borderRadius: 10,
+            padding: "12px 18px",
+            margin: "12px 0",
+            fontWeight: 700,
+            textAlign: "center",
+            position: "relative"
+          }}>
+            {error}
+            <span style={{
+              position: "absolute", right: 12, top: 8, cursor: "pointer", color: "#e53e3e"
+            }} onClick={() => setError("")}>✕</span>
+          </div>
+        )}
+        {status && !error && (
+          <div style={{
+            background: "#f0f7ff",
+            color: "#5B8CFF",
+            border: "1.5px solid #5B8CFF33",
+            borderRadius: 10,
+            padding: "10px 16px",
+            margin: "10px 0",
+            fontWeight: 600,
+            textAlign: "center"
+          }}>
+            任务状态：{status}
+          </div>
+        )}
         <div style={{ marginBottom: 20, background: sectionBg, borderRadius: 12, padding: 16, boxShadow: "0 2px 8px #e0e7ff33", minWidth: 0 }}>
           <textarea
             value={script}
             onChange={e => setScript(e.target.value)}
             rows={6}
             placeholder="请输入要生成视频的脚本..."
+            disabled={isGenerating}
             style={{
               width: "100%",
               minHeight: 120,
@@ -320,6 +394,7 @@ function App() {
           <div style={{ flex: 1, minWidth: 180 }}>
             <label style={{ fontWeight: 700, color: THEME.primary, marginRight: 8, fontSize: 17 }}>图片风格：</label>
             <select value={style} onChange={e => setStyle(e.target.value)}
+              disabled={isGenerating}
               style={{
                 borderRadius: 10,
                 padding: '10px 16px',
@@ -353,6 +428,7 @@ function App() {
           <div style={{ flex: 1, minWidth: 160 }}>
             <label style={{ fontWeight: 700, color: THEME.primary, marginRight: 8, fontSize: 16 }}>图片尺寸：</label>
             <select value={size} onChange={e => setSize(e.target.value)}
+              disabled={isGenerating}
               style={{
                 borderRadius: 8,
                 padding: '8px 14px',
@@ -373,6 +449,7 @@ function App() {
                 placeholder="如 900x1600"
                 value={customSize}
                 onChange={e => setCustomSize(e.target.value)}
+                disabled={isGenerating}
                 style={{
                   borderRadius: 8,
                   padding: '8px 14px',
@@ -388,6 +465,7 @@ function App() {
           <div style={{ flex: 1, minWidth: 180 }}>
             <label style={{ fontWeight: 700, color: THEME.accent, marginRight: 8, fontSize: 17 }}>TTS声音：</label>
             <select value={voice} onChange={e => setVoice(e.target.value)}
+              disabled={isGenerating}
               style={{
                 borderRadius: 10,
                 padding: '10px 16px',
@@ -494,47 +572,75 @@ function App() {
         </div>
         {formError && <div style={{ color: errorColor, fontWeight: 700, marginBottom: 10, textAlign: "center" }}>{formError}</div>}
         <div style={{ margin: '32px 0 18px 0', textAlign: 'center' }}>
-          <button
-            onClick={async () => {
-              setIsGenerating(true);
-              setProgress(5);
-              setStage('分镜生成中...');
-              await handleSubmit();
-            }}
-            disabled={isGenerating}
-            style={{
-              background: isGenerating ? PROGRESS_THEME.bar : THEME.primary,
-              color: '#fff',
-              fontWeight: 700,
-              fontSize: 18,
-              border: 'none',
-              borderRadius: 10,
-              padding: '12px 38px',
-              boxShadow: '0 2px 12px #5B8CFF22',
-              cursor: isGenerating ? 'not-allowed' : 'pointer',
-              opacity: isGenerating ? 0.7 : 1,
-              transition: 'all 0.2s',
-            }}
-          >
-            {isGenerating ? '正在生成视频...' : '一键生成视频'}
-          </button>
+          {isGenerating ? (
+            <button
+              onClick={handleCancel}
+              style={{
+                background: "#f66",
+                color: "#fff",
+                fontWeight: "bold",
+                border: "none",
+                borderRadius: 10,
+                padding: "12px 38px",
+                fontSize: 18,
+                cursor: "pointer",
+                opacity: 1,
+                transition: "all 0.2s",
+                display: "flex",
+                alignItems: "center",
+                gap: 10
+              }}
+              disabled={false}
+            >
+              <span className="spinner" style={{
+                width: 18, height: 18, border: "2.5px solid #fff", borderTop: "2.5px solid #f66",
+                borderRadius: "50%", display: "inline-block", animation: "spin 1s linear infinite"
+              }} />
+              取消生成
+            </button>
+          ) : (
+            <button
+              onClick={handleSubmit}
+              style={{
+                background: THEME.primary,
+                color: "#fff",
+                fontWeight: 700,
+                fontSize: 18,
+                border: "none",
+                borderRadius: 10,
+                padding: "12px 38px",
+                boxShadow: "0 2px 12px #5B8CFF22",
+                cursor: "pointer",
+                opacity: 1,
+                transition: "all 0.2s",
+              }}
+              disabled={isGenerating}
+            >
+              {videoUrl ? "重新生成" : "一键生成视频"}
+            </button>
+          )}
           {isGenerating && (
             <div style={{ marginTop: 18 }}>
-              <div style={{ color: PROGRESS_THEME.stage, fontWeight: 600, fontSize: 16, marginBottom: 6 }}>{stage}</div>
-              <div style={{ width: 320, height: 12, background: PROGRESS_THEME.bg, borderRadius: 8, overflow: 'hidden', margin: '0 auto' }}>
+              <div style={{
+                color: progress < 40 ? "#5B8CFF" : progress < 70 ? "#43cea2" : "#A389F4",
+                fontWeight: 700,
+                fontSize: 17,
+                marginBottom: 6
+              }}>
+                {stage}
+              </div>
+              <div style={{ width: 320, height: 14, background: PROGRESS_THEME.bg, borderRadius: 8, overflow: 'hidden', margin: '0 auto' }}>
                 <div style={{ width: `${progress}%`, height: '100%', background: PROGRESS_THEME.bar, borderRadius: 8, transition: 'width 0.5s' }} />
               </div>
-              <div style={{ color: PROGRESS_THEME.text, fontSize: 13, marginTop: 4 }}>{progress}%</div>
+              <div style={{ color: PROGRESS_THEME.text, fontSize: 13, marginTop: 4 }}>
+                {progress}% {progress < 100 && <span style={{ color: "#aaa" }}>（预计剩余时间：正在计算...）</span>}
+              </div>
             </div>
           )}
         </div>
-        <div style={{ margin: "10px 0", minHeight: 24, textAlign: "center" }}>
-          {status && <span>任务状态：{status}</span>}
-          {error && <div style={{ color: errorColor, fontWeight: 600 }}>{error}</div>}
-        </div>
         {videoUrl && (
-          <div style={{ marginTop: 28, textAlign: "center" }}>
-            <video src={videoUrl} controls width="100%" style={{
+          <div id="video-preview" style={{ marginTop: 28, textAlign: "center" }}>
+            <video ref={videoRef} src={videoUrl} controls width="100%" style={{
               borderRadius: 18,
               boxShadow: "0 2px 16px rgba(127,83,172,0.18)",
               marginBottom: 12,

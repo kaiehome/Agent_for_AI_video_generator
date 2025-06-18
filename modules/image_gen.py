@@ -33,7 +33,7 @@ def _get_default_image(idx: int) -> Optional[str]:
         return None
     return default_path
 
-def generate_image(text: str, idx: int, style: Optional[str] = None, size: Optional[str] = None, negative_prompt: Optional[str] = None) -> str:
+def generate_image(text: str, idx: int, style: Optional[str] = None, size: Optional[str] = None, negative_prompt: Optional[str] = None, output_dir: Optional[str] = None) -> str:
     if style == 'general':
         style = '<auto>'
     if not DASHSCOPE_API_KEY:
@@ -102,7 +102,9 @@ def generate_image(text: str, idx: int, style: Optional[str] = None, size: Optio
     else:
         print(f'[通义万相] 任务超时未完成 idx={idx}')
         return _get_default_image(idx)
-    img_path = os.path.join(IMG_DIR, f'segment_{idx}.jpg')
+    img_dir = output_dir or IMG_DIR
+    os.makedirs(img_dir, exist_ok=True)
+    img_path = os.path.join(img_dir, f'segment_{idx}.jpg')
     try:
         img_resp = requests.get(image_url, timeout=60)
         img_resp.raise_for_status()
@@ -127,7 +129,7 @@ class ImageGenerator:
             raise ValueError("DASHSCOPE_API_KEY 环境变量未设置，且未传入api_key参数！")
         self.base_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc/image-generation/generation"
     
-    async def generate_images(self, script_segments: List[Dict]) -> List[Dict]:
+    async def generate_images(self, script_segments: List[Dict], output_dir: Optional[str] = None) -> List[Dict]:
         """
         根据脚本分镜生成配图
         Args:
@@ -138,7 +140,7 @@ class ImageGenerator:
         loop = asyncio.get_event_loop()
         results = []
         for idx, seg in enumerate(script_segments):
-            img_path = await loop.run_in_executor(None, generate_image, seg.get('description', ''), idx, seg.get('mood', None), None, None)
+            img_path = await loop.run_in_executor(None, generate_image, seg.get('description', ''), idx, seg.get('mood', None), None, None, output_dir)
             seg['image_path'] = img_path
             results.append(seg)
         return results
